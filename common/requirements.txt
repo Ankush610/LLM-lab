@@ -1,0 +1,23 @@
+# Workshop dependencies.
+#
+# KAGGLE: do NOT `pip install -r` this file on Kaggle. The image already ships
+# a matched torch/CUDA pair and reinstalling torch will break the session.
+# Kaggle notebook 00 installs the short list below with --no-deps where needed.
+# This file is the reference for local and cluster ports.
+
+unsloth
+unsloth_zoo
+trl>=0.12.0
+peft>=0.13.0
+transformers>=4.46.0
+datasets>=3.0.0
+accelerate>=1.0.0
+bitsandbytes>=0.44.0
+sentencepiece
+protobuf
+huggingface_hub>=0.26.0
+
+# Lab 7 only, and only in a fresh session — vLLM pins its own torch build and
+# will fight the Unsloth environment if installed alongside it.
+# vllm>=0.6.3
+# openai>=1.50.0
