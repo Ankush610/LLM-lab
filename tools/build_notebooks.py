@@ -26,7 +26,7 @@ BOOTSTRAP = '''
 import os, sys, subprocess
 from pathlib import Path
 
-REPO_URL = "https://github.com/YOUR-USERNAME/LLM-lab.git"   # TODO: your repo
+REPO_URL = "https://github.com/Ankush610/LLM-lab.git"
 
 def find_repo() -> Path:
     for candidate in [Path("/kaggle/working/LLM-lab"), Path.cwd(), Path.cwd().parent]:
