@@ -298,10 +298,32 @@ def nb01() -> list[dict]:
         roughly 1.6 GB, plus overhead for the parts that stay in higher precision
         (embeddings, layer norms). Let's see what actually landed on the card.
 
+        **One trap first.** The obvious way to count parameters is wrong on a
+        4-bit model:
+
+        ```python
+        sum(p.numel() for p in model.parameters())   # says 1.80 B. Not true.
+        ```
+
+        bitsandbytes packs **two 4-bit values into every byte**, so a quantized
+        weight tensor reports exactly half the numbers it really holds. The
+        unpacked shape is kept on the side, in `p.quant_state.shape`:
+
+        ```python
+        def real_numel(p):
+            qs = getattr(p, "quant_state", None)
+            return qs.shape.numel() if qs is not None else p.numel()
+        ```
+
+        That is what `count_params` below does. Worth knowing, because the wrong
+        number is convincing — embeddings and norms are *not* quantized, so those
+        rows stay correct and only the layers you'd never hand-check are halved.
+
         > ↳ Slide: *Model Size based on Parameter Count and Precision*
         """),
         code('''
         import torch
+        from paramcount import count_params, real_numel
 
         def vram(label=""):
             used = torch.cuda.memory_allocated() / 2**30
@@ -309,9 +331,11 @@ def nb01() -> list[dict]:
             print(f"  {label:<28} {used:5.2f} GB in use   (peak {peak:5.2f} GB)")
             return used
 
-        n_params = sum(p.numel() for p in model.parameters())
+        n_params, _ = count_params(model)
+        naive = sum(p.numel() for p in model.parameters())
 
         print(f"  parameters                  {n_params/1e9:.2f} B")
+        print(f"  (naive numel() sum would say {naive/1e9:.2f} B - the 4-bit packing)")
         print(f"  if stored at fp16 (2 B)     {n_params*2/2**30:5.2f} GB")
         print(f"  if stored at 4-bit (0.5 B)  {n_params*0.5/2**30:5.2f} GB")
         print()
@@ -329,6 +353,15 @@ def nb01() -> list[dict]:
         Notice how much of the model is the **embedding table** — vocabulary size
         × hidden dimension is a surprisingly large slice for a small model.
 
+        Two things to look for in the output:
+
+        - **No "output head" row.** Llama 3.2 sets `tie_word_embeddings: true` —
+          the layer that turns hidden states back into vocabulary scores is the
+          *same tensor* as the input embedding, reused. One 394 M table doing
+          both jobs, which is a real chunk of a model this size.
+        - Every row uses `real_numel`, not `p.numel()`. Drop it and MLP and
+          attention silently halve, for the packing reason above.
+
         > ↳ Slide: *Parameters: weights, biases, token embedding, KV cache*
         """),
         code('''
@@ -344,7 +377,7 @@ def nb01() -> list[dict]:
             elif any(k in name for k in ("gate_proj","up_proj","down_proj")):
                                            key = "MLP (gate,up,down)"
             else:                          key = "other"
-            groups[key] += p.numel()
+            groups[key] += real_numel(p)          # not p.numel() - see above
 
         total = sum(groups.values())
         print(f"  {'component':<22} {'params':>12}   share")
@@ -353,6 +386,8 @@ def nb01() -> list[dict]:
             print(f"  {k:<22} {v/1e6:>9.1f} M   {v/total:>6.1%}")
         print("  " + "-"*48)
         print(f"  {'total':<22} {total/1e9:>9.2f} B")
+        print(f"\\n  output head tied to embeddings: "
+              f"{model.config.tie_word_embeddings}")
         '''),
 
         md("""
@@ -1028,10 +1063,16 @@ def nb03() -> list[dict]:
         ## 4.3 The payoff number
 
         This is the slide that made LoRA famous, as a number from your own run.
+
+        We count with `count_params` from Lab 1 rather than summing `numel()`:
+        the frozen base is 4-bit and packs two values per byte, so a naive total
+        comes out at 1.80 B and the trainable share looks twice as large as it
+        is. The adapter itself is fp16, so that half of the ratio is unaffected.
         """),
         code('''
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total     = sum(p.numel() for p in model.parameters())
+        from paramcount import count_params
+
+        total, trainable = count_params(model)
 
         print(f"  trainable parameters   {trainable:>15,}")
         print(f"  total parameters       {total:>15,}")
