@@ -1,0 +1,44 @@
+# How to build the Python environment for this lab. Pick ONE of the two below.
+# Do this on a login node (it needs internet). Run it once, then reuse it for
+# every job: training/run.sh and serving/download-model.py both use this env.
+
+
+# ============================================================
+#  OPTION A — conda
+# ============================================================
+
+conda create -n llmlab python=3.12 -y
+conda activate llmlab
+pip install -r requirements.txt
+
+# in run.sh, activate it with:
+#   source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate llmlab
+
+
+# ============================================================
+#  OPTION B — pip venv
+# ============================================================
+
+python3.12 -m venv ~/envs/llmlab
+source ~/envs/llmlab/bin/activate
+pip install -r requirements.txt
+
+# in run.sh, activate it with:
+#   source ~/envs/llmlab/bin/activate
+
+
+# ============================================================
+#  ONE THING TO CHECK: the torch CUDA build
+# ============================================================
+# Plain `pip install torch` gives you the default CUDA build. If your cluster's
+# driver is older than that build needs, torch installs fine but sees no GPU.
+#
+# Check the driver first:
+#   nvidia-smi          # top-right "CUDA Version:" is the newest CUDA it supports
+#
+# Then install torch from the matching index BEFORE the rest, e.g. for CUDA 12.8:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements.txt
+#
+# Verify:
+#   python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.device_count())"

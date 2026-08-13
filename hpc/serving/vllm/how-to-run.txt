@@ -1,0 +1,32 @@
+# Serve a model with vLLM on ONE GPU.
+# For 2 nodes x 2 GPUs, submit run.sh instead.
+#
+# You need: the .sif in this folder, and a model directory (your fine-tuned
+# "merged" folder, or a download from ../download-model.py).
+
+
+# 1. get an interactive GPU node
+salloc --gres=gpu:1 --cpus-per-task=8 --time=02:00:00
+
+
+# 2. start the server -- port 8000
+apptainer run --nv \
+  --bind /path/to/models:/model \
+  vllm-0.26.0-cuda13.0.sif serve
+
+# it serves whatever sits at /model. To point at a subfolder:
+#   --env MODEL=/model/qwen-sql
+# useful extras go after `serve`, e.g.:
+#   serve --max-model-len 4096 --gpu-memory-utilization 0.90
+
+
+# 3. check it, from the same node (wait for "Application startup complete")
+curl http://localhost:8000/v1/models
+
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"/model","messages":[{"role":"user","content":"CREATE TABLE head (age INTEGER)\n\nHow many heads are older than 56?"}]}'
+
+
+# 4. use it from your laptop -- tunnel the port, then open http://localhost:8000/docs
+ssh -L 8000:<compute-node>:8000 <you>@<login-node>

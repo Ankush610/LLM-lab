@@ -1,0 +1,404 @@
+Bootstrap: docker
+From: almalinux:9
+
+%labels
+    Author        HPC Container Team
+    Maintainer    ankushsonawane36@gmail.com
+    Version       1.0
+    Stack         llama.cpp
+    BaseImage     almalinux:9
+    CUDA          13.3
+    CUDASource    dnf-cuda-rhel9
+    Python        none
+    LlamaCpp      b10254
+    Description   llama.cpp GGUF model-serving container for GPU HPC (Slurm) nodes
+    BuildDate     2026-08-04
+
+%post
+    set -eux
+
+    LLAMA_TAG=b10254
+    CUDA_PKG_VER=13-3
+    CUDA_DIR=/usr/local/cuda-13.3
+    CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
+
+    export CCACHE_DIR=/mnt/ccache
+    export CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)"
+
+    # --- (a1) base OS + repos ---
+    echo "fastestmirror=1" >> /etc/dnf/dnf.conf
+
+    dnf -y install dnf-plugins-core epel-release
+    dnf config-manager --set-enabled crb
+    dnf -y group install "Development Tools"
+    dnf -y install --allowerasing \
+        wget curl git which tar gzip bzip2 xz unzip less jq nano \
+        cmake ninja-build ccache patchelf \
+        gcc-toolset-14-binutils \
+        openssl-devel zlib-devel libcurl-devel \
+        libgomp numactl numactl-libs \
+        ca-certificates procps-ng findutils hostname
+
+    # --- (a2) fabric / RDMA userspace: not installed (single-node stack) ---
+
+    # --- (b) CUDA toolkit ---
+    dnf config-manager --add-repo \
+        https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+    dnf -y install \
+        cuda-nvcc-${CUDA_PKG_VER} \
+        cuda-cudart-devel-${CUDA_PKG_VER} \
+        cuda-driver-devel-${CUDA_PKG_VER} \
+        libcublas-devel-${CUDA_PKG_VER}
+    ln -sfn "${CUDA_DIR}" /usr/local/cuda
+    echo "/usr/local/cuda/lib64" > /etc/ld.so.conf.d/cuda-local.conf
+    ldconfig
+
+    # --- (c) Python: not installed (serving-only image) ---
+
+    # --- (d) llama.cpp ---
+    export PATH=/opt/rh/gcc-toolset-14/root/usr/bin:$PATH
+
+    git clone --depth 1 --branch "${LLAMA_TAG}" \
+        https://github.com/ggml-org/llama.cpp /opt/build/llama.cpp
+
+    cmake -S /opt/build/llama.cpp -B /opt/build/llama.cpp/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_LIBDIR=lib64 \
+        -DCMAKE_CUDA_COMPILER="${CUDA_DIR}/bin/nvcc" \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+        -DGGML_CUDA=ON \
+        -DGGML_NATIVE=OFF \
+        -DGGML_BACKEND_DL=ON \
+        -DGGML_CPU_ALL_VARIANTS=ON \
+        -DGGML_BACKEND_DIR=/usr/local/lib64 \
+        -DBUILD_SHARED_LIBS=ON \
+        -DLLAMA_CURL=ON \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_TOOLS=ON \
+        -DLLAMA_BUILD_SERVER=ON
+
+    cmake --build /opt/build/llama.cpp/build
+    cmake --install /opt/build/llama.cpp/build --prefix /usr/local --strip
+
+    echo "/usr/local/lib64" > /etc/ld.so.conf.d/llamacpp.conf
+    ldconfig
+    llama-server --version
+
+    # --- (e) mount points ---
+    mkdir -p /code /data /output /model /scratch /workspace
+
+    # --- (e2) mode dispatcher ---
+    cat > /usr/local/bin/entrypoint <<'EOF'
+#!/bin/sh
+MODE="${1:-serve}"
+[ "$#" -gt 0 ] && shift
+case "$MODE" in
+    serve)
+        exec llama-server "$@" ;;
+    bench)
+        exec llama-bench "$@" ;;
+    *)
+        echo "Unknown mode: $MODE" >&2
+        echo "Available modes: serve | bench" >&2
+        echo "For the other tools: apptainer exec ... <sif> llama-cli --help" >&2
+        exit 1 ;;
+esac
+EOF
+    chmod +x /usr/local/bin/entrypoint
+    if /usr/local/bin/entrypoint bogus-mode 2>/dev/null; then
+        echo "dispatcher accepted a bogus mode" >&2
+        exit 1
+    fi
+
+    # --- (f) freeze: n/a, no Python package stack in this image ---
+
+    # --- (g) cleanup ---
+    rm -rf /opt/build
+    dnf clean all
+    rm -rf /var/cache/dnf /var/cache/yum
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    export CUDA_HOME=/usr/local/cuda
+    export PATH=${CUDA_HOME}/bin:${PATH}
+    export CUDA_MODULE_LOADING=LAZY
+
+    export LLAMA_ARG_HOST=0.0.0.0
+    export LLAMA_ARG_PORT=8080
+    export LLAMA_CACHE=/model/cache
+
+%test
+    #!/bin/sh
+    echo "== build =="
+    llama-server --version
+    llama-cli --version
+
+    echo "== backends =="
+    ls /usr/local/lib64/libggml-*.so
+
+    echo "== GPU visibility =="
+    if llama-cli --list-devices 2>&1 | grep -qi cuda; then
+        llama-cli --list-devices
+    else
+        echo "WARNING: no CUDA device listed. Fine on a CPU host / missing --nv."
+        echo "         On a GPU node, run: apptainer test --nv <sif>"
+    fi
+    exit 0
+
+%runscript
+    exec /usr/local/bin/entrypoint "$@"
+
+%startscript
+    exec /usr/local/bin/entrypoint "$@"
+
+%help
+================================================================================
+  WELCOME TO THE LLAMA.CPP CONTAINER
+================================================================================
+A GPU container that serves GGUF models over an OpenAI-compatible HTTP API.
+llama.cpp b10254 · CUDA 13.3 · AlmaLinux 9. Runs on GPU or CPU.
+This is an application container — it ships the llama.cpp binaries and nothing
+else. There is no Python in it. Mount your GGUF files at /model.
+
+New to Apptainer? Three commands you'll use:
+  apptainer run   <sif>   → just run it, easiest way to start
+  apptainer exec  <sif> X → run a specific command X inside it
+  apptainer shell <sif>   → drop into an interactive shell to look around
+
+
+================================================================================
+  QUICK START
+================================================================================
+  apptainer run --nv --bind /my/models:/model container.sif serve \
+    --model /model/your-model.gguf --n-gpu-layers 999
+
+Then, from the same node:
+  curl http://localhost:8080/v1/models
+
+(--nv gives it access to your GPU. Leave it out on a machine with no GPU.)
+
+Your host NVIDIA driver must be 580.65 or newer. Check with: nvidia-smi
+
+
+================================================================================
+  FLAGS YOU'LL ACTUALLY USE
+================================================================================
+  --nv                  Give the container access to your GPU(s).
+                        Use it any time you're doing GPU work.
+
+  --bind src:dst        Make a folder on your machine visible inside the
+                        container at path dst. This is how the container
+                        sees your models and writes downloads back out.
+                        Repeat the flag to bind more than one folder:
+                          --bind /my/models:/model --bind /my/data:/data
+
+  --env KEY=VALUE       Set an environment variable inside the container
+                        for this run only, e.g. --env CUDA_VISIBLE_DEVICES=0
+
+  (Everything else Apptainer offers is optional — you likely won't need it.
+  For the full list, see official help: apptainer help exec)
+
+
+================================================================================
+  DIRECTORIES INSIDE THE CONTAINER
+================================================================================
+These paths already exist inside the container, empty by default — bind your
+own folders onto them so the container can read your files and write results:
+
+  /model           your GGUF weights — the one you almost always need
+  /data            input files (prompts, grammars, eval sets)
+  /output          logs, benchmark results, quantized output
+  /code            helper scripts, if you have any
+  /scratch         node-local scratch space (temp files, not kept)
+  /workspace       spare mount point, for scripts that expect /workspace
+
+  Also automatically available, no --bind needed:
+  $HOME            your normal home directory
+  /tmp             temp space
+
+  Models pulled with -hf land in /model/cache, so bind /model to a real
+  directory or the download disappears when the container exits.
+
+
+================================================================================
+  WHAT YOU CAN RUN
+================================================================================
+Three ways to use this container: run it plainly, exec a specific task, or
+shell in to work interactively.
+
+  RUN — start one of the container's built-in modes
+  -------------------------------------------------------
+  What it does: launches a pre-built mode (serve, bench) that ships with the
+  container. You don't point it at a script — you just pick the mode you
+  want, and it starts. Everything after the mode name is passed straight
+  through to the underlying llama.cpp binary.
+
+  apptainer run --nv --bind /my/models:/model container.sif <mode> [ARGS...]
+
+  serve                 llama-server, OpenAI-compatible API on port 8080
+    apptainer run --nv --bind /my/models:/model container.sif serve \
+      --model /model/your-model.gguf --n-gpu-layers 999 --ctx-size 8192
+
+    Pull straight from Hugging Face instead of a local file:
+    apptainer run --nv --bind /my/models:/model container.sif serve \
+      -hf unsloth/Qwen3-8B-GGUF:Q4_K_M --n-gpu-layers 999
+
+  bench                 llama-bench, measures tokens/s on this node
+    apptainer run --nv --bind /my/models:/model container.sif bench \
+      -m /model/your-model.gguf -ngl 999
+
+  Running with no mode at all uses the default (serve). To be explicit,
+  always pass the mode you want.
+
+  The server binds 0.0.0.0:8080 by default. Change it with --port / --host,
+  or with --env LLAMA_ARG_PORT=9000. Any llama-server flag has a matching
+  LLAMA_ARG_* environment variable — handy in Slurm scripts.
+
+  EXEC — run your own commands and scripts
+  --------------------------------
+  What it does: runs a single command inside the container. The full set of
+  llama.cpp tools is on PATH, not just the two run modes.
+
+  apptainer exec --nv --bind <your binds> container.sif <command> [ARGS...]
+
+  CHAT — one-off generation on the command line
+    apptainer exec --nv --bind /my/models:/model container.sif \
+      llama-cli -m /model/your-model.gguf -ngl 999 -p "Explain MPI in one line."
+
+  QUANTIZE — shrink an existing GGUF
+    apptainer exec --bind /my/models:/model --bind /my/output:/output \
+      container.sif \
+      llama-quantize /model/model-f16.gguf /output/model-Q4_K_M.gguf Q4_K_M
+
+  PERPLEXITY — quality check after quantizing
+    apptainer exec --nv --bind /my/models:/model --bind /my/data:/data \
+      container.sif \
+      llama-perplexity -m /model/your-model.gguf -ngl 999 -f /data/wiki.test.raw
+
+  PICK A GPU — env var example
+    apptainer exec --nv --env CUDA_VISIBLE_DEVICES=0 \
+      --bind /my/models:/model container.sif \
+      llama-server --model /model/your-model.gguf -ngl 999
+
+  Other tools in the image: llama-tokenize, llama-gguf-split, llama-imatrix,
+  llama-export-lora, llama-batched-bench, llama-mtmd-cli (vision/audio
+  models), llama-tts. All take --help.
+
+  For embeddings, use the server: add --embedding to the serve line and POST
+  to /v1/embeddings. There is no standalone llama-embedding binary here.
+
+  SHELL — drop into an interactive prompt
+  --------------------------------
+  What it does: starts an interactive shell inside the container.
+  No command or script is executed automatically. Useful for
+  inspecting the environment, checking which binaries exist, or
+  running commands manually.
+
+  apptainer shell --nv \
+    --bind /my/models:/model \
+  container.sif
+
+  You're now inside the container. Type `exit` to leave.
+
+
+================================================================================
+  RUNNING ON THE CLUSTER (SLURM)
+================================================================================
+  SERVE ON A COMPUTE NODE
+  --------------------------------
+    #!/bin/bash
+    #SBATCH --job-name=llamacpp-serve
+    #SBATCH --nodes=1
+    #SBATCH --gres=gpu:1
+    #SBATCH --cpus-per-task=16
+    #SBATCH --time=08:00:00
+
+    echo "serving on $(hostname):8080"
+
+    srun apptainer run --nv \
+      --bind /my/models:/model \
+      container.sif serve \
+        --model /model/your-model.gguf \
+        --n-gpu-layers 999 --ctx-size 8192 --threads $SLURM_CPUS_PER_TASK
+
+  Then reach it from your laptop through the login node:
+    ssh -L 8080:<compute-node>:8080 <you>@<login-node>
+    curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+      -d '{"messages":[{"role":"user","content":"hi"}]}'
+
+  Put --api-key <secret> on the serve line if the node's network is shared.
+
+  MULTI-GPU, ONE NODE — a model too big for one card
+  --------------------------------
+    #SBATCH --gres=gpu:4
+
+    srun apptainer run --nv --bind /my/models:/model container.sif serve \
+      --model /model/big-model.gguf --n-gpu-layers 999 \
+      --split-mode layer --tensor-split 1,1,1,1
+
+  --split-mode layer is the default and the right choice on PCIe boxes;
+  --split-mode row is only worth trying with NVLink.
+
+  BATCH GENERATION — no server, just run and exit
+  --------------------------------
+    srun apptainer exec --nv \
+      --bind /my/models:/model --bind /my/data:/data --bind /my/output:/output \
+      container.sif \
+      llama-cli -m /model/your-model.gguf -ngl 999 \
+        -f /data/prompt.txt -n 512 --no-display-prompt > /output/result.txt
+
+  NETWORK NOTES
+  --------------------------------
+  This container is single-node: llama.cpp splits a model across the GPUs of
+  one node, not across nodes. There is no NCCL and no InfiniBand path here —
+  nothing to configure, and multi-node NCCL variables have no effect.
+
+  If the model does not fit on one node's GPUs, lower the quantization, or
+  offload the overflow to CPU RAM by giving --n-gpu-layers a number smaller
+  than the layer count instead of 999.
+
+
+================================================================================
+  INSTALLING EXTRA PACKAGES
+================================================================================
+This is a fixed application image, not a development environment: there is no
+Python, no pip and no uv in it, and nothing to unpin. The container filesystem
+resets on every fresh run, so anything you add is gone next time unless you use
+an overlay:
+
+  OVERLAY — add tools that stick around
+  --------------------------------
+    apptainer overlay create --size 1024 overlay.img
+    apptainer shell --nv --overlay overlay.img --bind /my/models:/model container.sif
+    dnf install <package>
+  Reuse the same overlay.img next time to see it again.
+
+  If you need Python tooling around your models — converting Hugging Face
+  weights to GGUF with convert_hf_to_gguf.py, or the gguf package — use the
+  PyTorch container for that step and bind the resulting .gguf in here. That
+  conversion needs torch, which is deliberately not in this image.
+
+  UPGRADING LLAMA.CPP
+  --------------------------------
+  Don't try to upgrade in place. llama.cpp moves fast and the binaries are
+  compiled against this image's CUDA. Bump LLAMA_TAG in the def file and
+  rebuild — that is the supported path.
+
+
+================================================================================
+  CHECKING IT WORKS
+================================================================================
+  apptainer test --nv container.sif
+
+Runs a quick built-in check: binary versions, which ggml backends are present,
+and whether a CUDA device is visible. If it passes, you're good to go.
+If it fails specifically on GPU access, run `nvidia-smi` on the host and
+make sure the driver supports CUDA 13.0 or newer (580.65+).
+
+If it starts but every token comes out on the CPU, you forgot --nv or
+--n-gpu-layers. The server prints how many layers it offloaded at startup —
+check that line first.
+================================================================================

@@ -1,0 +1,523 @@
+Bootstrap: docker
+From: almalinux:9
+
+%labels
+    Author        HPC Container Team
+    Maintainer    ankushsonawane36@gmail.com
+    Version       1.0
+    Stack         sglang
+    BaseImage     almalinux:9
+    CUDA          13.0
+    CUDASource    pip-wheels
+    Python        3.12
+    SGLang        0.5.17
+    PyTorch       2.11.0
+    Description   SGLang OpenAI-compatible inference server for GPU HPC (Slurm) nodes
+    BuildDate     2026-08-10
+
+%post
+    set -eux
+
+    export PIP_BREAK_SYSTEM_PACKAGES=1
+    export PIP_DEFAULT_TIMEOUT=100
+
+    export UV_CACHE_DIR=/mnt/uv
+    export UV_LINK_MODE=copy
+    export UV_PYTHON=/usr/bin/python3.12
+    export UV_SYSTEM_PYTHON=1
+    export UV_BREAK_SYSTEM_PACKAGES=1
+    export UV_INDEX_STRATEGY=unsafe-best-match
+    export UV_HTTP_TIMEOUT=100
+
+    # --- (a1) base OS + repos ---
+    echo "fastestmirror=1" >> /etc/dnf/dnf.conf
+
+    dnf -y install dnf-plugins-core epel-release
+    dnf config-manager --set-enabled crb
+    # gcc-c++ is a runtime dep, not build-only — see notes (a1)
+    dnf -y install --allowerasing \
+        gcc gcc-c++ make \
+        wget curl git git-lfs which tar gzip bzip2 xz unzip less jq nano \
+        openssh-clients \
+        openssl-devel zlib-devel libffi-devel bzip2-devel xz-devel \
+        libgomp c-ares \
+        libsndfile \
+        libavcodec-free libavdevice-free libavfilter-free libavformat-free \
+        libavutil-free libswresample-free libswscale-free \
+        ca-certificates procps-ng findutils hostname iproute
+
+    # --- (a2) fabric / RDMA userspace ---
+    dnf -y install \
+        rdma-core libibverbs librdmacm libibumad \
+        infiniband-diags numactl \
+        hwloc hwloc-libs \
+        ucx ucx-ib ucx-rdmacm
+
+    # --- (b) CUDA toolkit: pip wheels only, see (d2) ---
+
+    # --- (c) Python ---
+    dnf -y install python3.12 python3.12-devel python3.12-pip
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python3
+    python3.12 -m pip install --upgrade pip setuptools wheel uv
+    uv --version
+
+    # --- (d1) SGLang (pins its own torch + nvidia-*-cu13 wheels) ---
+    uv pip install --prerelease=explicit \
+        "sglang==0.5.17" \
+        "flash-attn-4>=4.0.0b18"
+
+    command -v sglang
+    command -v hf
+    python3.12 -c "import sglang; print(sglang.__version__)"
+
+    # --- (d2) nvcc for flashinfer's runtime JIT ---
+    # versions must stay in lockstep, and are named individually — see notes (d2)
+    uv pip install \
+        "nvidia-cuda-nvcc==13.0.88" \
+        "nvidia-cuda-crt==13.0.88" \
+        "nvidia-nvvm==13.0.88" \
+        "nvidia-cuda-runtime==13.0.96"
+
+    # the /usr/local/cuda tree flashinfer's ninja expects — see notes (d2)
+    CU=/usr/local/lib/python3.12/site-packages/nvidia/cu13
+    ln -sfn lib "$CU/lib64"
+    ln -sf libcudart.so.13 "$CU/lib/libcudart.so"
+    ln -sfn /.singularity.d/libs "$CU/lib/stubs"
+    ln -sfn "$CU" /usr/local/cuda
+    /usr/local/cuda/bin/nvcc --version
+
+    # --- (e) mount points ---
+    mkdir -p /code /data /output /model /scratch /workspace
+
+    # --- (e2) mode dispatcher ---
+    cat > /usr/local/bin/entrypoint <<'EOF'
+#!/bin/sh
+MODE="${1:-serve}"
+[ "$#" -gt 0 ] && shift
+case "$MODE" in
+    serve)
+        exec sglang serve "${MODEL:-/model}" \
+             --host 0.0.0.0 --port "${SERVE_PORT:-30000}" "$@" ;;
+    download)
+        if [ "$#" -eq 0 ]; then
+            echo "download needs a repo id: ... <sif> download meta-llama/Llama-3.1-8B-Instruct" >&2
+            exit 1
+        fi
+        exec hf download "$@" ;;
+    *)
+        echo "Unknown mode: $MODE" >&2
+        echo "Available modes: serve | download" >&2
+        echo "For your own commands: apptainer exec ... <sif> python -m sglang.bench_serving ..." >&2
+        exit 1 ;;
+esac
+EOF
+    chmod +x /usr/local/bin/entrypoint
+    if /usr/local/bin/entrypoint bogus-mode 2>/dev/null; then
+        echo "dispatcher accepted a bogus mode" >&2
+        exit 1
+    fi
+
+    # --- (f) freeze constraints ---
+    uv pip freeze > /opt/base-constraints.txt
+
+    # --- (g) cleanup ---
+    dnf clean all
+    rm -rf /var/cache/dnf /var/cache/yum
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONIOENCODING=utf-8
+
+    export PIP_CONSTRAINT=/opt/base-constraints.txt
+    export UV_CONSTRAINT=/opt/base-constraints.txt
+    export PIP_BREAK_SYSTEM_PACKAGES=1
+    export PIP_DEFAULT_TIMEOUT=100
+
+    export HF_HOME=/model/hf-cache
+    export HF_XET_HIGH_PERFORMANCE=1
+    export SERVE_PORT=30000
+
+    export CUDA_HOME=/usr/local/cuda
+    export PATH="$PATH:/usr/local/cuda/bin"
+    export CUDA_DEVICE_ORDER=PCI_BUS_ID
+    export CUDA_MODULE_LOADING=LAZY
+    export NCCL_DEBUG=WARN
+
+%test
+    #!/bin/sh
+    echo "== Python stack =="
+    python -c "import torch; print('torch', torch.__version__)"
+    python -c "import sglang; print('sglang', sglang.__version__)"
+    python -c "import transformers; print('transformers', transformers.__version__)"
+    python -c "import sgl_kernel, flashinfer; print('sgl_kernel + flashinfer OK')"
+    command -v sglang >/dev/null && echo "sglang CLI OK"
+
+    echo "== nvcc for flashinfer JIT =="
+    cat > /tmp/_ver.cu <<'CU'
+static_assert(CUDART_VERSION / 1000 == __CUDACC_VER_MAJOR__, "nvcc/cudart major mismatch");
+static_assert((CUDART_VERSION % 1000) / 10 == __CUDACC_VER_MINOR__, "nvcc/cudart minor mismatch");
+CU
+    if nvcc -c /tmp/_ver.cu -o /tmp/_ver.o 2>&1; then
+        nvcc --version | tail -2
+        echo "nvcc matches cudart headers OK"
+    else
+        echo "ERROR: nvcc missing or mismatched — flashinfer JIT will fail at runtime" >&2
+    fi
+    rm -f /tmp/_ver.cu /tmp/_ver.o
+
+    echo "== GPU visibility =="
+    if python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
+        python -c "import torch; print('CUDA OK:', torch.cuda.get_device_name(0))"
+        python -c "import torch; print('cuda', torch.version.cuda, '| GPUs', torch.cuda.device_count())"
+        python -c "import torch; print('nccl', torch.cuda.nccl.version())"
+        python - <<'PY'
+import torch
+built = [a for a in torch.cuda.get_arch_list() if a.startswith("sm_")]
+have = {(int(a[3:-1]), int(a[-1])) for a in built}
+for i in range(torch.cuda.device_count()):
+    maj, minor = torch.cuda.get_device_capability(i)
+    if not any(bm == maj and bn <= minor for bm, bn in have):
+        print(f"WARNING: GPU {i} is sm_{maj}{minor}, no compatible arch in {built} — "
+              f"SGLang's fused kernels may not load.")
+    elif maj < 8:
+        print(f"WARNING: GPU {i} is sm_{maj}{minor}; SGLang needs sm_80+ (Ampere or "
+              f"newer) for its default attention backends.")
+PY
+    else
+        echo "WARNING: no GPU visible. Fine on a CPU host / missing --nv."
+        echo "         On a GPU node, run: apptainer test --nv <sif>"
+    fi
+
+    echo "== /dev/shm =="
+    shm=$(df -k /dev/shm | awk 'NR==2{print $2}')
+    if [ "${shm:-0}" -lt 2097152 ]; then
+        echo "WARNING: /dev/shm < 2 GiB — tensor-parallel workers will hang or crash."
+        echo "         Bind a larger one: --bind /run/shm:/dev/shm"
+    else
+        echo "/dev/shm OK ($((shm / 1024)) MiB)"
+    fi
+
+%runscript
+    exec /usr/local/bin/entrypoint "$@"
+
+%startscript
+    exec /usr/local/bin/entrypoint "$@"
+
+%help
+================================================================================
+  WELCOME TO THE SGLANG CONTAINER
+================================================================================
+A GPU container that serves large language models over an OpenAI-compatible
+HTTP API. SGLang 0.5.17 · PyTorch 2.11.0 · CUDA 13.0 · Python 3.12 · AlmaLinux 9.
+No model weights baked in — mount your own at /model.
+
+New to Apptainer? Three commands you'll use:
+  apptainer run   <sif>   → just run it, easiest way to start
+  apptainer exec  <sif> X → run a specific command X inside it
+  apptainer shell <sif>   → drop into an interactive shell to look around
+
+
+================================================================================
+  QUICK START
+================================================================================
+  apptainer run --nv --bind /my/models:/model container.sif serve
+
+Serves whatever model sits at /model on port 30000. Then, from anywhere that
+can reach that node:
+
+  curl http://<node>:30000/v1/models
+  curl http://<node>:30000/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"/model","prompt":"Hello","max_tokens":32}'
+
+SGLang also exposes its own native endpoints alongside the OpenAI ones:
+  curl http://<node>:30000/health
+  curl http://<node>:30000/get_model_info
+  curl http://<node>:30000/generate \
+    -H 'Content-Type: application/json' \
+    -d '{"text":"Hello","sampling_params":{"max_new_tokens":32}}'
+
+(--nv gives it access to your GPU. SGLang will not start without a GPU.)
+
+Your host NVIDIA driver must be 580.65 or newer. Check with: nvidia-smi
+Your GPUs must be sm_80 or newer (A100, L40S, Ada, Hopper, Blackwell).
+
+
+================================================================================
+  FLAGS YOU'LL ACTUALLY USE
+================================================================================
+  --nv                  Give the container access to your GPU(s).
+                        Required — SGLang is GPU-only.
+
+  --bind src:dst        Make a folder on your machine visible inside the
+                        container at path dst. This is how the container
+                        sees your weights and writes logs back out.
+                        Repeat the flag to bind more than one folder:
+                          --bind /my/models:/model --bind /my/output:/output
+
+  --env KEY=VALUE       Set an environment variable inside the container
+                        for this run only, e.g. --env SERVE_PORT=30100
+
+  (Everything else Apptainer offers is optional — you likely won't need it.
+  For the full list, see official help: apptainer help exec)
+
+
+================================================================================
+  DIRECTORIES INSIDE THE CONTAINER
+================================================================================
+These paths already exist inside the container, empty by default — bind your
+own folders onto them so the container can read your files and write results:
+
+  /model           model weights; also where Hugging Face downloads land
+                   (HF_HOME=/model/hf-cache), so bind it read-write if you
+                   want SGLang to fetch weights itself
+  /output          server logs, traces, benchmark results
+  /data            prompt sets, eval datasets
+  /code            your own client or benchmark scripts
+  /scratch         node-local scratch space (temp files, not kept)
+  /workspace       spare mount point
+
+  Also automatically available, no --bind needed:
+  $HOME            your normal home directory — SGLang's torch.compile and
+                   JIT kernel caches live under $HOME/.cache (torchinductor,
+                   flashinfer, triton). Point TORCHINDUCTOR_CACHE_DIR and
+                   FLASHINFER_WORKSPACE_BASE elsewhere if your home is small
+                   or slow. flashinfer compiles its attention kernels with
+                   the bundled nvcc on first serve — expect several extra
+                   minutes on a cold cache, and keep $HOME writable or the
+                   server will not start
+  /tmp             temp space
+
+
+================================================================================
+  WHAT YOU CAN RUN
+================================================================================
+Three ways to use this container: run it plainly, exec a specific task, or
+shell in to work interactively.
+
+  RUN — start one of the container's built-in modes
+  -------------------------------------------------------
+  What it does: launches a pre-built mode (serve, download) that ships with
+  the container. Anything you type after the mode name is passed straight
+  through to SGLang, so every `sglang serve` flag still works.
+
+  apptainer run --nv --bind /my/models:/model container.sif <mode> [ARGS...]
+
+  serve                 OpenAI-compatible API server on port 30000
+    apptainer run --nv --bind /my/models:/model container.sif serve
+
+    Pick a different model directory or a Hugging Face repo id with MODEL:
+      apptainer run --nv --bind /my/models:/model \
+        --env MODEL=/model/Llama-3.1-8B-Instruct container.sif \
+        serve --served-model-name llama3
+
+    Four GPUs on one node:
+      apptainer run --nv --bind /my/models:/model container.sif \
+        serve --tp-size 4
+
+    Common flags: --tp-size N, --dp-size N, --context-length N,
+    --mem-fraction-static 0.85, --dtype bfloat16, --api-key <key>,
+    --quantization fp8, --enable-metrics, --trust-remote-code.
+    Full list: apptainer exec <sif> sglang serve --help
+
+  download              fetch weights from Hugging Face into /model
+    apptainer run --bind /my/models:/model container.sif \
+      download meta-llama/Llama-3.1-8B-Instruct
+
+    Run this on a login node that has internet, then serve from the compute
+    node offline. Gated repos need a token:
+      --env HF_TOKEN=hf_xxx
+
+  Running with no mode at all uses the default (serve). To be explicit,
+  always pass the mode you want.
+
+  EXEC — run your own commands and scripts
+  --------------------------------
+  What it does: runs a single command, or one of your own scripts, inside
+  the container. Use it for offline batch inference, benchmarking, or
+  anything that isn't the server.
+
+  apptainer exec --nv --bind <your binds> container.sif <command> [ARGS...]
+
+  OFFLINE BATCH — no server, drive SGLang from Python
+    apptainer exec --nv \
+      --bind /my/models:/model --bind /my/code:/code --bind /my/output:/output \
+      container.sif python /code/batch_infer.py
+
+    where batch_infer.py is roughly:
+      import sglang as sgl
+      llm = sgl.Engine(model_path="/model", tp_size=1)
+      out = llm.generate(["Hello"], {"max_new_tokens": 64})
+      print(out[0]["text"])
+
+  BENCHMARK — measure throughput and latency
+    Against a running server:
+      apptainer exec --nv container.sif \
+        python -m sglang.bench_serving --backend sglang \
+          --host 127.0.0.1 --port 30000 --num-prompts 200
+
+    Without a server (offline):
+      apptainer exec --nv --bind /my/models:/model container.sif \
+        python -m sglang.bench_offline_throughput --model-path /model \
+          --num-prompts 100
+
+  PICK A GPU — env var example
+    apptainer exec --nv --env CUDA_VISIBLE_DEVICES=0 \
+      --bind /my/models:/model container.sif \
+      sglang serve /model --host 0.0.0.0 --port 30000
+
+  SHELL — drop into an interactive prompt
+  --------------------------------
+  What it does: starts an interactive shell inside the container.
+  No command or script is executed automatically. Useful for
+  inspecting the environment, checking installed packages, or
+  running commands manually.
+
+  apptainer shell --nv \
+    --bind /my/models:/model \
+  container.sif
+
+  You're now inside the container. Type `exit` to leave.
+
+  BACKGROUND SERVER — keep it running and come back to it
+  --------------------------------
+    apptainer instance start --nv --bind /my/models:/model container.sif sgl-srv
+    apptainer instance list
+    apptainer instance stop sgl-srv
+
+
+================================================================================
+  RUNNING ON THE CLUSTER (SLURM)
+================================================================================
+  SINGLE NODE, ONE OR MORE GPUS
+  --------------------------------
+    #!/bin/bash
+    #SBATCH --job-name=sglang-serve
+    #SBATCH --nodes=1
+    #SBATCH --gres=gpu:4
+    #SBATCH --cpus-per-task=32
+    #SBATCH --time=08:00:00
+
+    echo "serving on $(hostname):30000"
+
+    srun apptainer run --nv \
+      --bind /my/models:/model --bind /my/output:/output \
+      container.sif serve --tp-size 4
+
+  Then reach it from your laptop through an SSH tunnel:
+    ssh -L 30000:<compute-node>:30000 <you>@<login-node>
+    # open http://localhost:30000/docs
+
+  MULTI-NODE (model too big for one node)
+  --------------------------------
+  SGLang shards across nodes itself — no Ray, no separate cluster to start.
+  Every node runs the same command with the same --dist-init-addr and a
+  different --node-rank; --tp-size is the TOTAL across all nodes.
+
+    #!/bin/bash
+    #SBATCH --nodes=2
+    #SBATCH --gres=gpu:4
+    #SBATCH --ntasks-per-node=1
+    #SBATCH --cpus-per-task=32
+
+    HEAD=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+    HEAD_IP=$(getent hosts "$HEAD" | awk '{print $1}')
+
+    srun apptainer run --nv \
+      --bind /my/models:/model --bind /my/output:/output \
+      container.sif serve \
+        --tp-size $((SLURM_NNODES * 4)) \
+        --nnodes "$SLURM_NNODES" \
+        --node-rank "$SLURM_PROCID" \
+        --dist-init-addr "$HEAD_IP:20000"
+
+  Only node-rank 0 serves the HTTP API; the others are workers. Every node
+  must see the same weights at /model, and port 20000 must be open between
+  nodes.
+
+  NETWORK NOTES
+  --------------------------------
+  On InfiniBand nodes nothing extra is needed — NCCL detects IB
+  automatically. On Ethernet-only nodes, add:
+    --env NCCL_IB_DISABLE=1 --env NCCL_SOCKET_IFNAME=<iface, e.g. eth0>
+  If multi-node hangs at startup, set --env NCCL_DEBUG=INFO and check
+  which interface NCCL picked.
+
+  From a batch script, the clean way to push these through is:
+    export APPTAINERENV_NCCL_IB_DISABLE=1
+    export APPTAINERENV_NCCL_SOCKET_IFNAME=eth0
+
+  Nodes with several HCAs: --env NCCL_IB_HCA=mlx5_0
+
+  Tensor-parallel workers that hang with no error are almost always a small
+  /dev/shm. Bind a bigger one: --bind /run/shm:/dev/shm
+
+
+================================================================================
+  INSTALLING EXTRA PACKAGES
+================================================================================
+Both `pip` and `uv` are installed. Either works inside a running container
+for that session — but the container filesystem resets on every fresh run,
+so anything you installed is gone next time unless you do one of the
+following:
+
+  METHOD 1: Overlay (quick, one-off)
+  --------------------------------
+    apptainer overlay create --size 1024 overlay.img
+    apptainer shell --nv --overlay overlay.img --bind /my/models:/model container.sif
+    pip install <package>              # or: uv pip install --system <package>
+  Reuse the same overlay.img next time to see it again.
+
+  METHOD 2: venv in $HOME (cleaner, long-term)
+  --------------------------------
+    python3 -m venv --system-site-packages $HOME/envs/myenv   # or: uv venv
+    source $HOME/envs/myenv/bin/activate
+    unset PIP_CONSTRAINT UV_CONSTRAINT
+    pip install <package>              # or: uv pip install <package>
+  Next time: just `source $HOME/envs/myenv/bin/activate`. Persists
+  automatically — $HOME is your real disk, not the container.
+  --system-site-packages keeps the base stack (sglang, torch, transformers,
+  flashinfer, etc.) visible. Unsetting the two CONSTRAINT vars releases the
+  base image's package lock.
+
+  No venv wanted? `unset PIP_CONSTRAINT UV_CONSTRAINT` on its own is enough —
+  the container's / is read-only, so pip falls back to
+  ~/.local/lib/python3.12/site-packages and persists the same way. The unset
+  is per-shell, so put it in $HOME/.bashrc if you always want the lock off.
+
+  uv has no such fallback — outside a venv or overlay it just errors on the
+  read-only filesystem. Give it a target explicitly:
+    uv pip install --target $HOME/.local/lib/python3.12/site-packages <pkg>
+
+  THE VERSION LOCK
+  --------------------------------
+  Do not upgrade torch, transformers or the nvidia-* wheels — SGLang 0.5.17
+  links against exactly torch 2.11.0 through sglang-kernel, flashinfer and
+  flash-attn-4, and those compiled kernels break on any other build. The
+  nvidia-cuda-nvcc/crt/nvvm wheels matter just as much: they must stay at the
+  same CUDA minor as nvidia-cuda-runtime, or flashinfer's JIT stops compiling
+  ("CUDA compiler and CUDA toolkit headers are incompatible"). Both tools are
+  locked to the base image's versions by default. Release the lock per-shell
+  only when you mean to:
+    unset PIP_CONSTRAINT UV_CONSTRAINT
+
+  Anything you install into $HOME is imported BEFORE the container's own
+  copy, and that directory is shared with every other python3.12 container
+  you run. If a container starts importing the wrong version, that is why.
+  Ignore $HOME's packages for a single run:
+    apptainer exec --nv --env PYTHONNOUSERSITE=1 container.sif ...
+
+
+================================================================================
+  CHECKING IT WORKS
+================================================================================
+  apptainer test --nv container.sif
+
+Runs a quick built-in check: imports, SGLang CLI, compiled kernel modules,
+GPU visibility, compiled arch coverage for your GPUs, NCCL version, and
+/dev/shm size. If it passes, you're good to go. If it fails specifically on
+GPU access, run `nvidia-smi` on the host and make sure the driver supports
+CUDA 13.0 or newer (580.65+).
+================================================================================
