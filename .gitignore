@@ -1,0 +1,34 @@
+# Model files / weights
+*.bin
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+hpc/serving/models/
+
+# Container / singularity images
+*.sif
+*.img
+
+# Logs
+*.log
+logs/
+hpc/serving/**/logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / editor cruft
+.DS_Store
+*.swp

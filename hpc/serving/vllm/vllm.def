@@ -1,0 +1,12 @@
+bootstrap: docker
+from: vllm/vllm-openai:v0.8.4
+
+%post
+    export PIP_BREAK_SYSTEM_PACKAGES=1
+    pip install --no-cache-dir pyarrow pandas
+
+%environment
+    # Container's own site-packages must win over anything a user might have
+    # in ~/.local -- without this, a bound $HOME with stray user-site pip
+    # packages can silently override the pinned vllm/torch/ray versions here.
+    export PYTHONNOUSERSITE=1
