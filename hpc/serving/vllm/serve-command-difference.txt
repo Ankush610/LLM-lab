@@ -1,0 +1,44 @@
+VLLM (single node, 2 GPU)
+=======================
+apptainer run --nv \
+  --bind /path/to/models:/models \
+  vllm.sif \
+  vllm serve /models/MODEL_NAME \
+  --tensor-parallel-size 2 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --gpu-memory-utilization 0.9 \
+  --max-model-len 4096 \
+  --dtype bfloat16
+
+=======================
+
+SGLANG (single node, 2 GPU)
+=======================
+apptainer run --nv \
+  --bind /path/to/models:/models \
+  sglang.sif \
+  python -m sglang.launch_server \
+  --model-path /models/MODEL_NAME \
+  --tp 2 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --mem-fraction-static 0.9 \
+  --context-length 4096 \
+  --dtype bfloat16
+
+=======================
+
+LLAMA.CPP (single node, 2 GPU)
+=======================
+apptainer run --nv \
+  --bind /path/to/models:/models \
+  llamacpp.sif \
+  ./server \
+  -m /models/MODEL_NAME.gguf \
+  --n-gpu-layers 999 \
+  --split-mode layer \
+  --tensor-split 1,1 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --ctx-size 4096
